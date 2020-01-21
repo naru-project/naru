@@ -95,7 +95,7 @@ We also include a set of baseline cardinality estimators known in the database l
 * Naru (`--glob` to find trained checkpoints)
 * Sampling (`--run-sampling`)
 * Bayes nets (`--run-bn`)
-* V-optimal histograms (`--run-maxdiff`)
+* MaxDiff n-dimensional histogram (`--run-maxdiff`)
 * Postgres (see `estimators.Postgres`)
 
 Example: to run experiments using trained Naru model(s) and a Sampler:
