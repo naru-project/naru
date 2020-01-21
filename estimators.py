@@ -3,6 +3,7 @@
 In practicular, inference algorithms for autoregressive density estimators can
 be found in 'ProgressiveSampling'.
 """
+import bisect
 import collections
 import json
 import operator
@@ -12,12 +13,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+import common
 import made
 import transformer
-
-from operator import itemgetter
-from bisect import bisect_left
-from bisect import bisect
 
 OPS = {
     '>': np.greater,
@@ -1012,21 +1010,16 @@ class MaxDiffHistogram(CardEst):
         self.num_new_partitions = 2
         # map<cid, map<bound_type, map<bound_value, list(partition id)>>>
         self.column_bound_map = {}
-        for cid in range(len(self.table.Columns())):
+        for cid in range(len(self.table.columns)):
             self.column_bound_map[cid] = {}
             self.column_bound_map[cid]['l'] = {}
             self.column_bound_map[cid]['u'] = {}
         # map<cid, map<bound_type, sorted_list(bound_value)>>
         self.column_bound_index = {}
-        for cid in range(len(self.table.Columns())):
+        for cid in range(len(self.table.columns)):
             self.column_bound_index[cid] = {}
             self.column_bound_index[cid]['l'] = []
             self.column_bound_index[cid]['u'] = []
-        # cname to cid mapping
-        self.cname_to_cid = {}
-        for cid in range(len(self.table.Columns())):
-            self.cname_to_cid[self.table.Columns()[cid].Name()] = cid
-
         self.name = str(self)
 
         print('Building MaxDiff histogram, may take a while...')
@@ -1060,22 +1053,14 @@ class MaxDiffHistogram(CardEst):
         for col in range(len(partition.boundaries)):
             vals = partition.col_value_list[col]
             counter_start = time.time()
-            counter = collections.Counter(vals)
+            counter = pd.Series(vals).value_counts().sort_index()
+
             # compute Diff(V, A)
-            first_key = True
-            prev_key = None
-            diff = []
-            diff_start = time.time()
-            for key in sorted(counter.keys()):
-                if first_key:
-                    first_key = False
-                    prev_key = key
-                else:
-                    spread = key - prev_key
-                    diff.append((prev_key, (spread * counter[prev_key])))
-                    prev_key = key
-            diff.append((prev_key, (0 * counter[prev_key])))
-            maxdiff = max(diff, key=operator.itemgetter(1))[1]
+            spread = counter.index[1:] - counter.index[:-1]
+            spread_m_counts = spread * counter.iloc[:-1]
+            maxdiff = 0
+            if len(spread_m_counts) > 0:
+                maxdiff = max(spread_m_counts.values.max(), 0)
             if maxdiff not in self.maxdiff:
                 self.maxdiff[maxdiff] = [(partition, col)]
             else:
@@ -1086,33 +1071,23 @@ class MaxDiffHistogram(CardEst):
         # initial partition
         p = self.Partition()
         # populate initial boundary
-        for cid in range(len(self.table.Columns())):
-            if not self.table.Columns()[cid].data.dtype == 'int64':
-                p.boundaries.append((0, self.table.Columns()[cid].distribution_size, True))
+        for cid in range(len(self.table.columns)):
+            if not self.table.columns[cid].data.dtype == 'int64':
+                p.boundaries.append(
+                    (0, self.table.columns[cid].distribution_size, True))
             else:
-                p.boundaries.append((min(self.table.Columns()[cid].data),
-                                     max(self.table.Columns()[cid].data), True))
+                p.boundaries.append((min(self.table.columns[cid].data),
+                                     max(self.table.columns[cid].data), True))
         # include all rowids
+        self.table_ds = common.TableDataset(self.table)
         num_rows = self.table.cardinality
-        p.data_points = list(np.arange(num_rows))
+        p.data_points = np.arange(num_rows)
         for cid in range(len(p.boundaries)):
-            if not self.table.Columns()[cid].data.dtype == 'int64':
-                if self.table.Columns()[cid].Name() == 'Reg Valid Date':
-                    p.col_value_list[cid] = [
-                        self.table.Columns()[cid].ValToBin(self.table.Columns()[cid].data[rowid].to_datetime64()) for rowid in p.data_points
-                    ]
-                else:
-                    p.col_value_list[cid] = [
-                        self.table.Columns()[cid].ValToBin(self.table.Columns()[cid].data[rowid]) for rowid in p.data_points
-                    ]
+            if not self.table.columns[cid].data.dtype == 'int64':
+                p.col_value_list[cid] = self.table_ds.tuples_np[:, cid]
             else:
-                p.col_value_list[cid] = [
-                    self.table.Columns()[cid].data[rowid] for rowid in p.data_points
-                ]
-        pos = 0
-        for rowid in p.data_points:
-            p.rowid_to_position[rowid] = pos
-            pos += 1
+                p.col_value_list[cid] = self.table.columns[cid].data[:, cid]
+        p.rowid_to_position = list(np.arange(num_rows))
         self.partition_to_maxdiff[p] = set()
         self._compute_maxdiff(p)
         self.partitions.append(p)
@@ -1121,8 +1096,9 @@ class MaxDiffHistogram(CardEst):
             start_next_partition = time.time()
             (split_partition_index, split_column_index, partition_boundaries,
              global_maxdiff) = self.next_partition_candidate(
-                 self.partitions, len(self.table.Columns()), self.table,
-                 min(self.num_new_partitions, self.limit - len(self.partitions) + 1), self.maxdiff)
+                 self.partitions, len(self.table.columns), self.table,
+                 min(self.num_new_partitions,
+                     self.limit - len(self.partitions) + 1), self.maxdiff)
             print('determining partition number ', len(self.partitions))
             if global_maxdiff == 0:
                 print('maxdiff already 0 before reaching bucket limit')
@@ -1137,7 +1113,7 @@ class MaxDiffHistogram(CardEst):
             for d in self.partition_to_maxdiff[
                     self.partitions[split_partition_index]]:
                 remove_set = set()
-                for cid in range(len(self.table.Columns())):
+                for cid in range(len(self.table.columns)):
                     remove_set.add(
                         (self.partitions[split_partition_index], cid))
                 for tp in remove_set:
@@ -1158,27 +1134,20 @@ class MaxDiffHistogram(CardEst):
             total_distinct = 1
             for cid, boundary in enumerate(partition.boundaries):
                 distinct = len(
-                    set(self.table.Columns()[cid].data[rowid]
+                    set(self.table.columns[cid].data[rowid]
                         for rowid in partition.data_points))
                 if distinct == 1:
-                    if not self.table.Columns()[cid].data.dtype == 'int64':
-                        if self.table.Columns()[cid].Name() == 'Reg Valid Date':
-                            partition.uniform_spreads.append([
-                                list(
-                                    set(self.table.Columns()[cid].ValToBin(self.table.Columns()[cid].data[rowid].to_datetime64())
-                                        for rowid in partition.data_points))[0]
-                            ])
-                        else:
-                            partition.uniform_spreads.append([
-                                list(
-                                    set(self.table.Columns()[cid].ValToBin(self.table.Columns()[cid].data[rowid])
-                                        for rowid in partition.data_points))[0]
-                            ])
+                    if not self.table.columns[cid].data.dtype == 'int64':
+                        partition.uniform_spreads.append([
+                            list(
+                                set(self.table_ds.
+                                    tuples_np[partition.data_points, cid]))[0]
+                        ])
                     else:
                         partition.uniform_spreads.append([
                             list(
-                                set(self.table.Columns()[cid].data[rowid]
-                                    for rowid in partition.data_points))[0]
+                                set(self.table.columns[cid].data[
+                                    partition.data_points]))[0]
                         ])
                 else:
                     uniform_spread = None
@@ -1201,7 +1170,7 @@ class MaxDiffHistogram(CardEst):
         print('total number of point is ', total_point)
 
         # populate column bound map and list metadata
-        for cid in range(len(self.table.Columns())):
+        for cid in range(len(self.table.columns)):
             for pid, partition in enumerate(self.partitions):
                 if partition.boundaries[cid][0] not in self.column_bound_map[
                         cid]['l']:
@@ -1276,16 +1245,15 @@ class MaxDiffHistogram(CardEst):
             new_partitions.append(new_partition)
         # distribute data points to new partitions
         for rowid in partition.data_points:
-            if not self.table.Columns()[partition_column_index].data.dtype == 'int64':
-                if self.table.Columns()[partition_column_index].Name() == 'Reg Valid Date':
-                    val = self.table.Columns()[partition_column_index].ValToBin(self.table.Columns()[partition_column_index].data[rowid].to_datetime64())
-                else:
-                    val = self.table.Columns()[partition_column_index].ValToBin(self.table.Columns()[partition_column_index].data[rowid])
+            if not self.table.columns[
+                    partition_column_index].data.dtype == 'int64':
+                val = self.table_ds.tuples_np[rowid, partition_column_index]
             else:
-                val = self.table.Columns()[partition_column_index].data[rowid]
+                val = self.table.columns[partition_column_index].data[rowid]
             # find the new partition that the row belongs to
-            new_partitions[bisect_left(partition_boundaries,
-                                       val)].data_points.append(rowid)
+            new_partitions[bisect.bisect_left(partition_boundaries,
+                                              val)].data_points.append(rowid)
+
         # debug
         start = time.time()
         for new_partition in new_partitions:
@@ -1302,24 +1270,26 @@ class MaxDiffHistogram(CardEst):
             if len(new_partition.data_points) == 0:
                 print('found partition with no data!')
                 print(sorted(
-                    list(self.table.Columns()[partition_column_index].data[rowid]
+                    list(self.table.columns[partition_column_index].data[rowid]
                          for rowid in partition.data_points)))
                 print(partition_boundaries)
         return new_partitions
 
     def _populate_column_set_map(self, c, o, v, column_set_map):
-        cid = self.cname_to_cid[c.Name()]
+        cid = self.table.ColumnIndex(c.name)
         column_set_map[cid] = set()
         if o in ['<', '<=']:
             insert_index = None
             if o == '<':
-                insert_index = bisect_left(self.column_bound_index[cid]['l'], v)
+                insert_index = bisect.bisect_left(
+                    self.column_bound_index[cid]['l'], v)
                 for i in range(insert_index):
                     column_set_map[cid] = column_set_map[cid].union(
                         self.column_bound_map[cid]['l'][
                             self.column_bound_index[cid]['l'][i]])
             else:
-                insert_index = bisect(self.column_bound_index[cid]['l'], v)
+                insert_index = bisect.bisect(self.column_bound_index[cid]['l'],
+                                             v)
                 for i in range(insert_index):
                     if self.column_bound_index[cid]['l'][i] == v:
                         for pid in self.column_bound_map[cid]['l'][v]:
@@ -1334,9 +1304,11 @@ class MaxDiffHistogram(CardEst):
         elif o in ['>', '>=']:
             insert_index = None
             if o == '>':
-                insert_index = bisect(self.column_bound_index[cid]['u'], v)
+                insert_index = bisect.bisect(self.column_bound_index[cid]['u'],
+                                             v)
             else:
-                insert_index = bisect_left(self.column_bound_index[cid]['u'], v)
+                insert_index = bisect.bisect_left(
+                    self.column_bound_index[cid]['u'], v)
             for i in range(insert_index,
                            len(self.column_bound_index[cid]['u'])):
                 column_set_map[cid] = column_set_map[cid].union(
@@ -1345,7 +1317,7 @@ class MaxDiffHistogram(CardEst):
         else:
             assert o == '=', o
             lower_bound_set = set()
-            insert_index = bisect(self.column_bound_index[cid]['l'], v)
+            insert_index = bisect.bisect(self.column_bound_index[cid]['l'], v)
             for i in range(insert_index):
                 if self.column_bound_index[cid]['l'][i] == v:
                     for pid in self.column_bound_map[cid]['l'][v]:
@@ -1358,7 +1330,8 @@ class MaxDiffHistogram(CardEst):
                             self.column_bound_index[cid]['l'][i]])
 
             upper_bound_set = set()
-            insert_index = bisect_left(self.column_bound_index[cid]['u'], v)
+            insert_index = bisect.bisect_left(self.column_bound_index[cid]['u'],
+                                              v)
             for i in range(insert_index,
                            len(self.column_bound_index[cid]['u'])):
                 upper_bound_set = upper_bound_set.union(
@@ -1373,23 +1346,23 @@ class MaxDiffHistogram(CardEst):
         for c, o, v in zip(columns, operators, vals):
             if not c.data.dtype == 'int64':
                 v = c.ValToBin(v)
-            cid = self.cname_to_cid[c.Name()]
+            cid = self.table.ColumnIndex(c.name)
             observed_cid.append(cid)
             spread = partition.uniform_spreads[cid]
             if o in ['<', '<=']:
                 if o == '<':
-                    distinct_val_covered = distinct_val_covered * bisect_left(
+                    distinct_val_covered = distinct_val_covered * bisect.bisect_left(
                         spread, v)
                 else:
-                    distinct_val_covered = distinct_val_covered * bisect(
+                    distinct_val_covered = distinct_val_covered * bisect.bisect(
                         spread, v)
             elif o in ['>', '>=']:
                 if o == '>':
                     distinct_val_covered = distinct_val_covered * (
-                        len(spread) - bisect(spread, v))
+                        len(spread) - bisect.bisect(spread, v))
                 else:
                     distinct_val_covered = distinct_val_covered * (
-                        len(spread) - bisect_left(spread, v))
+                        len(spread) - bisect.bisect_left(spread, v))
             else:
                 assert o == '=', o
                 if not v in spread:
