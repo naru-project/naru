@@ -1,11 +1,7 @@
 __pycache__
-<<<<<<< HEAD
 .DS_Store
 models
 datasets
 results
 .vscode/settings.json
 .style.yapf
-=======
-.DS_Store
->>>>>>> 264cf4e9c96c9e34422f9eebc455a714aeef0b57
