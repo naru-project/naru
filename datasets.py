@@ -5,7 +5,10 @@ import numpy as np
 
 import common
 
+<<<<<<< HEAD
 import pandas as pd
+=======
+>>>>>>> 264cf4e9c96c9e34422f9eebc455a714aeef0b57
 
 def LoadDmv(filename='Vehicle__Snowmobile__and_Boat_Registrations.csv'):
     csv_file = './datasets/{}'.format(filename)
@@ -19,6 +22,7 @@ def LoadDmv(filename='Vehicle__Snowmobile__and_Boat_Registrations.csv'):
     # there is the same as the default str-ordering (lexicographical).
     type_casts = {'Reg Valid Date': np.datetime64}
     return common.CsvTable('DMV', csv_file, cols, type_casts)
+<<<<<<< HEAD
 
 def LoadCover(filename="cover.csv"):
     filepath = './datasets/{}'.format(filename)
@@ -36,3 +40,5 @@ def LoadTpcH(filename="order_zip8.csv",sampling=False):
     if(sampling):
         df = df.sample(frac=sampling,random_state=1)
     return common.CsvTable(filename.rstrip(".csv"),df,cols=df.columns)
+=======
+>>>>>>> 264cf4e9c96c9e34422f9eebc455a714aeef0b57
